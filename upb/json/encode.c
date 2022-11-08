@@ -769,6 +769,17 @@ static size_t jsonenc_nullz(jsonenc* e, size_t size) {
   return ret;
 }
 
+static size_t upb_JsonEncoder_Encode(jsonenc* const encoder,
+                                     const upb_Message* const msg,
+                                     const upb_MessageDef* const m,
+                                     const size_t size) {
+  if (UPB_SETJMP(encoder->err) != 0) return -1;
+
+  jsonenc_msgfield(encoder, msg, m);
+  if (encoder->arena) upb_Arena_Free(encoder->arena);
+  return jsonenc_nullz(encoder, size);
+}
+
 size_t upb_JsonEncode(const upb_Message* msg, const upb_MessageDef* m,
                       const upb_DefPool* ext_pool, int options, char* buf,
                       size_t size, upb_Status* status) {
@@ -783,9 +794,5 @@ size_t upb_JsonEncode(const upb_Message* msg, const upb_MessageDef* m,
   e.status = status;
   e.arena = NULL;
 
-  if (UPB_SETJMP(e.err)) return -1;
-
-  jsonenc_msgfield(&e, msg, m);
-  if (e.arena) upb_Arena_Free(e.arena);
-  return jsonenc_nullz(&e, size);
+  return upb_JsonEncoder_Encode(&e, msg, m, size);
 }
