@@ -27,6 +27,8 @@ cc_library(
         "zero_copy_input_stream.h",
         "zero_copy_output_stream.h",
     ],
+    compatible_with = ["//buildenv/target:non_prod"],
+    visibility = ["//:__pkg__"],
     deps = [
         "//:base",
         "//:mem",

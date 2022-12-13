@@ -149,6 +149,7 @@ cc_library(
         ":mini_table_internal",
         ":port",
         ":wire",
+        "//upb/io:zero_copy_stream",
     ],
 )
 
@@ -266,7 +267,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":collections_internal",
-        ":eps_copy_input_stream",
         ":hash",
         ":message_internal",
         ":mini_table_internal",
@@ -366,6 +366,7 @@ cc_library(
         ":collections_internal",
         ":hash",
         ":upb",
+        "//upb/io:zero_copy_stream",
     ],
 )
 
@@ -398,6 +399,7 @@ cc_library(
         ":hash",
         ":mini_table",
         ":upb",
+        "//upb/io:zero_copy_stream",
     ],
 )
 
@@ -922,6 +924,7 @@ cc_library(
         ":mini_table_internal",
         ":port",
         ":wire_internal",
+        "//upb/io:zero_copy_stream",
     ],
 )
 
@@ -945,13 +948,14 @@ cc_library(
     deps = [
         ":base",
         ":collections_internal",
-        ":eps_copy_input_stream",
         ":hash",
         ":mem_internal",
         ":message_internal",
         ":mini_table_internal",
         ":port",
+        ":wire_reader",
         ":wire_types",
+        "//upb/io:zero_copy_stream",
         "@utf8_range",
     ],
 )
@@ -963,28 +967,21 @@ cc_library(
 )
 
 cc_library(
-    name = "eps_copy_input_stream",
-    srcs = ["upb/wire/eps_copy_input_stream.c"],
-    hdrs = ["upb/wire/eps_copy_input_stream.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":mem",
-        ":port",
-    ],
-)
-
-cc_library(
     name = "wire_reader",
     srcs = [
+        "upb/wire/eps_copy_input_stream.c",
         "upb/wire/reader.c",
-        "upb/wire/swap_internal.h",
     ],
-    hdrs = ["upb/wire/reader.h"],
+    hdrs = [
+        "upb/wire/eps_copy_input_stream.h",
+        "upb/wire/reader.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
-        ":eps_copy_input_stream",
+        ":base",
+        ":mem",
         ":port",
-        ":wire_types",
+        "//upb/io:zero_copy_stream",
     ],
 )
 
@@ -992,8 +989,10 @@ cc_test(
     name = "eps_copy_input_stream_test",
     srcs = ["upb/wire/eps_copy_input_stream_test.cc"],
     deps = [
-        ":eps_copy_input_stream",
+        ":port",
         ":upb",
+        ":wire_reader",
+        "//upb/io:zero_copy_stream",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -1050,7 +1049,6 @@ upb_amalgamation(
         ":base",
         ":collections_internal",
         ":descriptor_upb_proto",
-        ":eps_copy_input_stream",
         ":fastdecode",
         ":hash",
         ":lex",
@@ -1088,7 +1086,6 @@ upb_amalgamation(
         ":collections_internal",
         ":descriptor_upb_proto",
         ":descriptor_upb_proto_reflection",
-        ":eps_copy_input_stream",
         ":fastdecode",
         ":hash",
         ":json",
@@ -1128,7 +1125,6 @@ upb_amalgamation(
         ":base",
         ":collections_internal",
         ":descriptor_upb_proto",
-        ":eps_copy_input_stream",
         ":fastdecode",
         ":hash",
         ":json",

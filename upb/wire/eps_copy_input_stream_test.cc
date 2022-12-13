@@ -2,21 +2,26 @@
 
 #include <string.h>
 
+#include <cstdio>
 #include <string>
 
 #include "gtest/gtest.h"
 #include "upb/upb.hpp"
 // begin:google_only
 // #include "testing/fuzzing/fuzztest.h"
+// #include "upb/io/zero_copy_input_stream.h"
 // end:google_only
+
+// Must be last
+#include "upb/port/def.inc"
 
 namespace {
 
 TEST(EpsCopyInputStreamTest, ZeroSize) {
   upb_EpsCopyInputStream stream;
   const char* ptr = NULL;
-  upb_EpsCopyInputStream_Init(&stream, &ptr, 0, false);
-  EXPECT_TRUE(upb_EpsCopyInputStream_IsDoneWithCallback(&stream, &ptr, NULL));
+  ptr = upb_EpsCopyInputStream_Init(&stream, ptr, 0, NULL, false);
+  EXPECT_TRUE(upb_EpsCopyInputStream_IsDone(&stream, &ptr));
 }
 
 // begin:google_only
@@ -26,7 +31,9 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //
 // class FakeStream {
 //  public:
-//   FakeStream(const std::string& data) : data_(data), offset_(0) {
+//   FakeStream(const std::string& data, bool stream)
+//       : data_(data), offset_(0), stream_(stream) {
+//     fprintf(stderr, "FakeStream stream=%d\n", (int)stream);
 //     limits_.push_back(data.size());
 //   }
 //
@@ -34,14 +41,14 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   // ended.  If we tried to read beyond the current limit, returns -1.
 //   // Otherwise, for simple success, returns 0.
 //   int ReadData(int n, std::string* data) {
-//     if (n > BytesUntilLimit()) return -1;
+//     if (n > BytesUntilLimit(false)) return -1;
 //
 //     data->assign(data_.data() + offset_, n);
 //     offset_ += n;
 //
 //     int end_limit_count = 0;
 //
-//     while (BytesUntilLimit() == 0) {
+//     while (BytesUntilLimit(false) == 0) {
 //       if (PopLimit()) {
 //         end_limit_count++;
 //       } else {
@@ -54,7 +61,7 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   }
 //
 //   bool TryPushLimit(int limit) {
-//     if (!CheckSize(limit)) return false;
+//     if (!CheckSize(limit, true)) return false;
 //     limits_.push_back(offset_ + limit);
 //     return true;
 //   }
@@ -62,8 +69,19 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   bool IsEof() const { return eof_; }
 //
 //  private:
-//   int BytesUntilLimit() const { return limits_.back() - offset_; }
-//   bool CheckSize(int size) const { return BytesUntilLimit() >= size; }
+//   int BytesUntilLimit(bool fogged) const {
+//     if (limits_.size() == 1 && fogged && stream_ &&
+//         offset_ < limits_[0] - kUpb_EpsCopyInputStream_SlopBytes) {
+//       return INT_MAX - offset_;
+//     }
+//     return limits_.back() - offset_;
+//   }
+//
+//   bool CheckSize(int size, bool fogged) const {
+//     fprintf(stderr, "FakeStream::BytesUntilLimit()=%d, offset=%d\n",
+//             BytesUntilLimit(fogged), offset_);
+//     return BytesUntilLimit(fogged) >= size;
+//   }
 //
 //   // Return false on EOF.
 //   bool PopLimit() {
@@ -75,21 +93,152 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   // Limits, specified in absolute stream terms.
 //   std::vector<int> limits_;
 //   int offset_;
+//   // When we are streaming, we do not have visibility into the end-of-stream
+//   // limit until we are within kSlopBytes of it.
+//   bool stream_;
 //   bool eof_ = false;
 // };
 //
 // char tmp_buf[kUpb_EpsCopyInputStream_SlopBytes];
 //
+// // This class is like a std::string, except we can "delete" bytes from the
+// // beginning of a string when they should no longer be accessible, without
+// // moving or invalidating the remaining bytes.  We can't actually delete the
+// // front bytes, but we can poison them to make them behave as though they are
+// // deleted when used with ASAN.  This will help verify that our streaming
+// // abstractions are not accessing bytes after they should no longer be
+// // accessible.
+// class StreamingString {
+//  public:
+//   StreamingString(absl::string_view data) : data_(data) {}
+//
+//   ~StreamingString() {
+//     UPB_UNPOISON_MEMORY_REGION(data_.data(), poison_offset_);
+//   }
+//
+//   void DeleteFront(size_t bytes) {
+//     UPB_POISON_MEMORY_REGION(data_.data() + poison_offset_, bytes);
+//     poison_offset_ += bytes;
+//   }
+//
+//   char* data() { return data_.data() + poison_offset_; }
+//   const char* data() const { return data_.data() + poison_offset_; }
+//   size_t size() const { return data_.size() - poison_offset_; }
+//
+//  private:
+//   std::string data_;
+//   size_t poison_offset_ = 0;
+// };
+//
+// // A upb_ZeroCopyInputStream that vends a data buffer split into several
+// // sub-buffers. Used to test that consumers can handle buffer seams in arbitrary
+// // places.
+// class SeamStream : public upb_ZeroCopyInputStream {
+//  public:
+//   SeamStream(const std::string& data, const std::vector<int>& chunks) {
+//     CHECK(!chunks.empty());
+//     int ofs = chunks[0];
+//     for (int i = 1; i < chunks.size(); ++i) {
+//       int chunk = chunks[i];
+//       if (data.size() - ofs < chunk) break;
+//       data_.push_back(absl::string_view(data.substr(ofs, chunk)));
+//       ofs += chunk;
+//     }
+//     if (ofs < data.size()) data_.push_back(absl::string_view(data.substr(ofs)));
+//     for (const auto chunk : data_) {
+//       fprintf(stderr, "- SeamStream chunk size=%zu, data=%s\n", chunk.size(),
+//               chunk.data());
+//     }
+//     this->vtable = &static_vtable;
+//   }
+//
+//   int LastChunkSize() const { return data_.back().size(); }
+//
+//   static const void* Next(upb_ZeroCopyInputStream* z, size_t* count,
+//                           upb_Status* status) {
+//     SeamStream* s = reinterpret_cast<SeamStream*>(z);
+//     if (!s->again_) s->data_.pop_front();
+//     if (s->data_.empty()) {
+//       *count = 0;
+//       return NULL;
+//     }
+//     s->again_ = false;
+//     s->position_ += s->data_.front().size();
+//     *count = s->data_.front().size();
+//     return s->data_.front().data();
+//   }
+//
+//   static void BackUp(upb_ZeroCopyInputStream* z, size_t count) {
+//     SeamStream* s = reinterpret_cast<SeamStream*>(z);
+//     CHECK(!s->again_);  // Can't back up twice in a row.
+//     CHECK(s->data_.front().size() >= count);
+//
+//     // This will prevent access to anything behind the back up point. This may
+//     // be a bit more strict than what ZeroCopyInputStream specifies in its
+//     // contract, but generally we want our decoders to respect this rule.
+//     s->data_.front().DeleteFront(s->data_.front().size() - count);
+//
+//     s->again_ = true;
+//     s->position_ -= count;
+//   }
+//
+//   static bool Skip(upb_ZeroCopyInputStream* z, size_t count) {
+//     SeamStream* s = reinterpret_cast<SeamStream*>(z);
+//     while (count && !s->data_.empty()) {
+//       if (count < s->data_.front().size()) break;
+//       count -= s->data_.front().size();
+//       s->data_.pop_front();
+//     }
+//     if (count) {
+//       if (s->data_.empty()) return false;
+//       s->data_.front().DeleteFront(count);
+//     }
+//     s->position_ += count;
+//     return true;
+//   }
+//
+//   static size_t ByteCount(const upb_ZeroCopyInputStream* z) {
+//     const SeamStream* s = reinterpret_cast<const SeamStream*>(z);
+//     return s->position_;
+//   }
+//
+//  private:
+//   std::deque<StreamingString> data_;
+//   bool again_ = true;
+//   size_t position_ = 0;
+//   static _upb_ZeroCopyInputStream_VTable static_vtable;
+// };
+//
+// _upb_ZeroCopyInputStream_VTable SeamStream::static_vtable = {
+//     &SeamStream::Next, &SeamStream::BackUp, &SeamStream::Skip,
+//     &SeamStream::ByteCount};
+//
 // class EpsStream {
 //  public:
-//   EpsStream(const std::string& data, bool enable_aliasing)
-//       : data_(data), enable_aliasing_(enable_aliasing) {
-//     ptr_ = data_.data();
-//     upb_EpsCopyInputStream_Init(&eps_, &ptr_, data_.size(), enable_aliasing);
+//   EpsStream(const std::string& data, const std::vector<int>& chunks,
+//             bool enable_aliasing)
+//       : total_size_(data.size()), enable_aliasing_(enable_aliasing) {
+//     size_t flat_data_size = data.size();
+//     if (!chunks.empty() && chunks[0] < flat_data_size) {
+//       flat_data_size = std::min<size_t>(flat_data_size, chunks[0]);
+//       fprintf(stderr, "EpsStream flat_data_.size()=%zu, data=%.*s\n",
+//               flat_data_size, (int)flat_data_size, data.data());
+//       seam_stream_ = std::make_unique<SeamStream>(data, chunks);
+//     } else {
+//       fprintf(stderr, "EpsStream data is totally flat, size=%zu\n",
+//               flat_data_size);
+//     }
+//     flat_data_.assign(data.data(), flat_data_size);
+//     ptr_ = flat_data_.data();
+//     ptr_ = upb_EpsCopyInputStream_Init(&eps_, ptr_, flat_data_.size(),
+//                                        seam_stream_.get(), enable_aliasing);
 //   }
+//
+//   bool streaming() const { return seam_stream_.get() != nullptr; }
 //
 //   // Returns false at EOF or error.
 //   int ReadData(int n, std::string* data) {
+//     fprintf(stderr, "ReadData n=%d\n", n);
 //     EXPECT_LE(n, kUpb_EpsCopyInputStream_SlopBytes);
 //     if (enable_aliasing_) {
 //       EXPECT_TRUE(upb_EpsCopyInputStream_AliasingAvailable(&eps_, ptr_, n));
@@ -114,11 +263,12 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //     }
 //     ptr_ = upb_EpsCopyInputStream_ReadString(&eps_, &str_data, n, arena_.ptr());
 //     if (!ptr_) return -1;
-//     if (enable_aliasing_ && n) {
+//     if (!seam_stream_ && enable_aliasing_ && n) {
 //       EXPECT_GE(reinterpret_cast<uintptr_t>(str_data),
-//                 reinterpret_cast<uintptr_t>(data_.data()));
-//       EXPECT_LT(reinterpret_cast<uintptr_t>(str_data),
-//                 reinterpret_cast<uintptr_t>(data_.data() + data_.size()));
+//                 reinterpret_cast<uintptr_t>(flat_data_.data()));
+//       EXPECT_LT(
+//           reinterpret_cast<uintptr_t>(str_data),
+//           reinterpret_cast<uintptr_t>(flat_data_.data() + flat_data_.size()));
 //       EXPECT_TRUE(upb_EpsCopyInputStream_AliasingAvailable(&eps_, ptr_, 0));
 //     }
 //     data->assign(str_data, n);
@@ -126,6 +276,7 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   }
 //
 //   bool TryPushLimit(int limit) {
+//     fprintf(stderr, "TryPushLimit, limit=%d\n", limit);
 //     if (!upb_EpsCopyInputStream_CheckSize(&eps_, ptr_, limit)) return false;
 //     deltas_.push_back(upb_EpsCopyInputStream_PushLimit(&eps_, ptr_, limit));
 //     return true;
@@ -138,7 +289,7 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //     int end_limit_count = 0;
 //
 //     while (IsAtLimit()) {
-//       if (error_) return -1;
+//       if (IsError()) return -1;
 //       if (PopLimit()) {
 //         end_limit_count++;
 //       } else {
@@ -147,12 +298,20 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //       }
 //     }
 //
-//     return error_ ? -1 : end_limit_count;
+//     return IsError() ? -1 : end_limit_count;
 //   }
 //
 //   bool IsAtLimit() {
-//     return upb_EpsCopyInputStream_IsDoneWithCallback(
+//     bool ret = upb_EpsCopyInputStream_IsDoneWithCallback(
 //         &eps_, &ptr_, &EpsStream::IsDoneFallback);
+//     fprintf(stderr, "IsAtLimit=%d\n", (int)ret);
+//     return ret;
+//   }
+//
+//   bool IsError() const {
+//     EXPECT_EQ(error_, eps_.error);
+//     fprintf(stderr, "IsError=%d\n", (int)error_);
+//     return error_;
 //   }
 //
 //   // Return false on EOF.
@@ -165,6 +324,7 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //
 //   static const char* IsDoneFallback(upb_EpsCopyInputStream* e, const char* ptr,
 //                                     int overrun) {
+//     fprintf(stderr, "IsDoneFallback, overrun=%d\n", overrun);
 //     return _upb_EpsCopyInputStream_IsDoneFallbackInline(
 //         e, ptr, overrun, &EpsStream::BufferFlipCallback);
 //   }
@@ -178,7 +338,9 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   }
 //
 //   upb_EpsCopyInputStream eps_;
-//   std::string data_;
+//   int total_size_;
+//   std::string flat_data_;
+//   std::unique_ptr<SeamStream> seam_stream_;
 //   const char* ptr_;
 //   std::vector<int> deltas_;
 //   upb::Arena arena_;
@@ -207,6 +369,7 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //   int data_size;
 //   bool enable_aliasing;
 //   std::vector<Op> ops;
+//   std::vector<int> chunks;
 // };
 //
 // auto ArbitraryEpsCopyTestScript() {
@@ -224,23 +387,31 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //       Arbitrary<bool>(),          // enable_aliasing
 //       VectorOf(VariantOf(
 //           // ReadOp
-//           StructOf<ReadOp>(InRange(0, kUpb_EpsCopyInputStream_SlopBytes)),
+//           StructOf<ReadOp>(InRange(1, kUpb_EpsCopyInputStream_SlopBytes)),
 //           // ReadStringOp
 //           StructOf<ReadStringOp>(NonNegative<int>()),
 //           // PushLimitOp
-//           StructOf<PushLimitOp>(NonNegative<int>()))));
+//           StructOf<PushLimitOp>(NonNegative<int>()))),
+//       VectorOf(InRange(1, max_data_size)));
 // }
 //
 // // Run a test that creates both real stream and a fake stream, and validates
 // // that they have the same behavior.
 // void TestAgainstFakeStream(const EpsCopyTestScript& script) {
 //   std::string data(script.data_size, 'x');
+//   std::string printable_chars;
+//   for (char ch = 'A'; ch <= 'Z'; ++ch) printable_chars += ch;
+//   for (char ch = 'a'; ch <= 'z'; ++ch) printable_chars += ch;
+//   for (char ch = '0'; ch <= '9'; ++ch) printable_chars += ch;
+//   int char_idx = 0;
 //   for (int i = 0; i < script.data_size; ++i) {
-//     data[i] = static_cast<char>(i & 0xff);
+//     // Avoid putting any zeroes in the buffer.
+//     data[i] = printable_chars[char_idx++];
+//     if (char_idx == printable_chars.size()) char_idx = 0;
 //   }
 //
-//   FakeStream fake_stream(data);
-//   EpsStream eps_stream(data, script.enable_aliasing);
+//   EpsStream eps_stream(data, script.chunks, script.enable_aliasing);
+//   FakeStream fake_stream(data, eps_stream.streaming());
 //
 //   for (const auto& op : script.ops) {
 //     if (const ReadOp* read_op = std::get_if<ReadOp>(&op)) {
@@ -327,6 +498,55 @@ TEST(EpsCopyInputStreamTest, ZeroSize) {
 //
 // TEST(EpsCopyFuzzTest, FirstBufferAliasing) {
 //   TestAgainstFakeStream({7, true, {ReadStringOp{3}}});
+// }
+//
+// TEST(EpsCopyFuzzTest, SmallFirstBufferInStream) {
+//   TestAgainstFakeStream({32, false, {ReadOp{8}}, {1}});
+// }
+//
+// TEST(EpsCopyFuzzTest, ManyShort) {
+//   TestAgainstFakeStream({32,
+//                          true,
+//                          {
+//                              ReadOp{1},
+//                          },
+//                          {1, 1}});
+// }
+//
+// TEST(EpsCopyFuzzTest, ManyShort2) {
+//   TestAgainstFakeStream({181,
+//                          false,
+//                          {ReadOp{1}, ReadOp{13}, ReadStringOp{0}},
+//                          {1, 1, 1, 1, 9, 1}});
+// }
+//
+// TEST(EpsCopyFuzzTest, HugeLimit) {
+//   TestAgainstFakeStream({64, false, {PushLimitOp{884509199}}, {1}});
+// }
+//
+// TEST(EpsCopyFuzzTest, HugeLimit2) {
+//   TestAgainstFakeStream({16, false, {PushLimitOp{884509199}}, {1, 1, 1, 161}});
+// }
+//
+// TEST(EpsCopyFuzzTest, HugeLimit3) {
+//   TestAgainstFakeStream(
+//       {129, true, {ReadOp{1}, PushLimitOp{2147483647}}, {1, 1, 1, 20, 307}});
+// }
+//
+// TEST(EpsCopyFuzzTest, OversizeReadString) {
+//   TestAgainstFakeStream({278,
+//                          false,
+//                          {ReadStringOp{0}, ReadOp{16}, ReadOp{1}, ReadOp{10},
+//                           ReadOp{16}, ReadOp{12}, ReadStringOp{1349638079}},
+//                          {2, 70, 316, 39, 1, 1, 1, 375, 414}});
+// }
+//
+// TEST(EpsCopyFuzzTest, LargeChunkSeenInFallback) {
+//   TestAgainstFakeStream({18, false, {ReadOp{16}}, {1, 1, 16}});
+// }
+//
+// TEST(EpsCopyFuzzTest, Foo) {
+//   TestAgainstFakeStream({319, true, {PushLimitOp{2147483647}}, {159, 160}});
 // }
 //
 // end:google_only
